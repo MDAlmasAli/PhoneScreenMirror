@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 if not exist ".git" (
     echo This folder is not a git repository.
-    echo Clone/download the repository first, then run this file.
+    echo Clone the repository with git first, then run this file.
     pause
     exit /b 1
 )
