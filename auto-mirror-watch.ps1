@@ -91,6 +91,7 @@ Write-Host ""
 function Start-ScrcpyMirror {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][string]$DisplayName,
         [Parameter(Mandatory = $true)]$Quality,
         [Parameter(Mandatory = $true)][int]$Port
     )
@@ -100,7 +101,9 @@ function Start-ScrcpyMirror {
     $stdoutLog = Join-Path $logDir ("scrcpy-$safeSerial-$stamp.out.log")
     $stderrLog = Join-Path $logDir ("scrcpy-$safeSerial-$stamp.err.log")
 
-    $argList = @("-s", $Serial, "--window-title=$Serial", "--stay-awake", "--port=$Port",
+    $windowTitle = "$DisplayName [$Serial]"
+    $escapedWindowTitle = $windowTitle -replace '"', '\"'
+    $argList = @("-s", $Serial, "--window-title=`"$escapedWindowTitle`"", "--stay-awake", "--port=$Port",
                  "--max-fps=$($Quality.Fps)", "--video-bit-rate=$($Quality.Bitrate)")
     if ($Quality.Size -gt 0) { $argList += "--max-size=$($Quality.Size)" }
 
@@ -138,6 +141,66 @@ function Start-ScrcpyMirror {
     return $proc
 }
 
+function Clean-AdbValue {
+    param(
+        [AllowNull()][string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    $clean = $Value.Trim()
+    if ($clean -eq 'null' -or $clean -eq 'unknown' -or $clean -eq '<unknown>') {
+        return $null
+    }
+
+    return $clean
+}
+
+function Get-AdbShellValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][string[]]$Command
+    )
+
+    try {
+        $value = & $adb -s $Serial shell @Command 2>$null
+        return Clean-AdbValue (($value -join "`n") -replace "`r", "")
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-DeviceDisplayName {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial
+    )
+
+    $candidates = @(
+        (Get-AdbShellValue -Serial $Serial -Command @("settings", "get", "secure", "bluetooth_name")),
+        (Get-AdbShellValue -Serial $Serial -Command @("settings", "get", "global", "device_name")),
+        (Get-AdbShellValue -Serial $Serial -Command @("getprop", "ro.product.marketname")),
+        (Get-AdbShellValue -Serial $Serial -Command @("getprop", "ro.product.vendor.marketname")),
+        (Get-AdbShellValue -Serial $Serial -Command @("getprop", "ro.product.model"))
+    )
+
+    foreach ($candidate in $candidates) {
+        if ($null -ne $candidate) {
+            return $candidate
+        }
+    }
+
+    $manufacturer = Get-AdbShellValue -Serial $Serial -Command @("getprop", "ro.product.manufacturer")
+    $model = Get-AdbShellValue -Serial $Serial -Command @("getprop", "ro.product.model")
+    if ($null -ne $manufacturer -and $null -ne $model) {
+        return "$manufacturer $model"
+    }
+
+    return $Serial
+}
+
 function Get-FreeScrcpyPort {
     param(
         [Parameter(Mandatory = $true)]$AssignedPorts
@@ -155,6 +218,7 @@ function Get-FreeScrcpyPort {
 # Remember which serials we've already launched (and their process)
 $mirrored = @{}
 $portsBySerial = @{}
+$namesBySerial = @{}
 $lastLaunchAt = [DateTime]::MinValue
 
 # Heartbeat: print "still watching" once in a while so you know it's alive
@@ -197,10 +261,15 @@ while ($true) {
                         continue
                     }
 
-                    Write-Host ("[+] " + (Get-Date -Format 'HH:mm:ss') + "  New device: $serial  -> starting mirror")
+                    if (-not $namesBySerial.ContainsKey($serial)) {
+                        $namesBySerial[$serial] = Get-DeviceDisplayName -Serial $serial
+                    }
+
+                    $displayName = $namesBySerial[$serial]
+                    Write-Host ("[+] " + (Get-Date -Format 'HH:mm:ss') + "  New device: $displayName ($serial)  -> starting mirror")
                     $portsBySerial[$serial] = $port
                     $lastLaunchAt = Get-Date
-                    $proc = Start-ScrcpyMirror -Serial $serial -Quality $q -Port $port
+                    $proc = Start-ScrcpyMirror -Serial $serial -DisplayName $displayName -Quality $q -Port $port
                     if ($null -ne $proc) {
                         $mirrored[$serial] = $proc
                         $launchedThisPass = $true
@@ -221,6 +290,7 @@ while ($true) {
                 Write-Host ("[-] " + (Get-Date -Format 'HH:mm:ss') + "  Device removed: $serial")
                 $mirrored.Remove($serial)
                 $portsBySerial.Remove($serial)
+                $namesBySerial.Remove($serial)
             }
             elseif ($mirrored[$serial].HasExited) {
                 # User closed the scrcpy window manually -> allow re-mirror later

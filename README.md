@@ -7,6 +7,7 @@ scrcpy.
 
 - Watches for connected Android phones every 2 seconds.
 - Starts a separate scrcpy mirror window for each new phone.
+- Shows the phone name/model in each mirror window title.
 - Lets you choose video quality: Max, Mid, or Min.
 - Saves the chosen quality in `quality.cfg` for next time.
 - Keeps the phone screen awake while mirroring.
