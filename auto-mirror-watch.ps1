@@ -11,6 +11,9 @@
 # ============================================================
 
 $PollSeconds = 2        # how often to re-scan for new devices
+$LaunchGapSeconds = 6   # wait between starting scrcpy windows
+$PortBase = 27183       # first scrcpy local port to assign
+$PortMax = 27199        # last scrcpy local port to assign
 
 # Never let a stray error kill the watcher loop
 $ErrorActionPreference = 'Continue'
@@ -88,7 +91,8 @@ Write-Host ""
 function Start-ScrcpyMirror {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
-        [Parameter(Mandatory = $true)]$Quality
+        [Parameter(Mandatory = $true)]$Quality,
+        [Parameter(Mandatory = $true)][int]$Port
     )
 
     $safeSerial = ($Serial -replace '[^\w.-]', '_')
@@ -96,7 +100,7 @@ function Start-ScrcpyMirror {
     $stdoutLog = Join-Path $logDir ("scrcpy-$safeSerial-$stamp.out.log")
     $stderrLog = Join-Path $logDir ("scrcpy-$safeSerial-$stamp.err.log")
 
-    $argList = @("-s", $Serial, "--window-title=$Serial", "--stay-awake",
+    $argList = @("-s", $Serial, "--window-title=$Serial", "--stay-awake", "--port=$Port",
                  "--max-fps=$($Quality.Fps)", "--video-bit-rate=$($Quality.Bitrate)")
     if ($Quality.Size -gt 0) { $argList += "--max-size=$($Quality.Size)" }
 
@@ -129,12 +133,29 @@ function Start-ScrcpyMirror {
         return $null
     }
 
+    Write-Host ("    port: " + $Port)
     Write-Host ("    logs: " + $stderrLog)
     return $proc
 }
 
+function Get-FreeScrcpyPort {
+    param(
+        [Parameter(Mandatory = $true)]$AssignedPorts
+    )
+
+    for ($candidate = $PortBase; $candidate -le $PortMax; $candidate++) {
+        if (-not $AssignedPorts.ContainsValue($candidate)) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
 # Remember which serials we've already launched (and their process)
 $mirrored = @{}
+$portsBySerial = @{}
+$lastLaunchAt = [DateTime]::MinValue
 
 # Heartbeat: print "still watching" once in a while so you know it's alive
 $tick      = 0
@@ -152,6 +173,7 @@ while ($true) {
         $lines = & $adb devices 2>$null
 
         $current = @{}
+        $launchedThisPass = $false
         foreach ($line in $lines) {
             # Lines look like:  R5CRB06E9XX<TAB>device
             if ($line -match '^(\S+)\s+(device|unauthorized|offline)\s*$') {
@@ -160,10 +182,31 @@ while ($true) {
                 $current[$serial] = $status
 
                 if ($status -eq 'device' -and -not $mirrored.ContainsKey($serial)) {
+                    if ($launchedThisPass) {
+                        continue
+                    }
+
+                    $secondsSinceLaunch = ((Get-Date) - $lastLaunchAt).TotalSeconds
+                    if ($secondsSinceLaunch -lt $LaunchGapSeconds) {
+                        continue
+                    }
+
+                    $port = Get-FreeScrcpyPort -AssignedPorts $portsBySerial
+                    if ($null -eq $port) {
+                        Write-Host ("[!] " + (Get-Date -Format 'HH:mm:ss') + "  No free scrcpy port left for $serial")
+                        continue
+                    }
+
                     Write-Host ("[+] " + (Get-Date -Format 'HH:mm:ss') + "  New device: $serial  -> starting mirror")
-                    $proc = Start-ScrcpyMirror -Serial $serial -Quality $q
+                    $portsBySerial[$serial] = $port
+                    $lastLaunchAt = Get-Date
+                    $proc = Start-ScrcpyMirror -Serial $serial -Quality $q -Port $port
                     if ($null -ne $proc) {
                         $mirrored[$serial] = $proc
+                        $launchedThisPass = $true
+                    }
+                    else {
+                        $portsBySerial.Remove($serial)
                     }
                 }
                 elseif ($status -eq 'unauthorized') {
@@ -177,10 +220,12 @@ while ($true) {
             if (-not $current.ContainsKey($serial)) {
                 Write-Host ("[-] " + (Get-Date -Format 'HH:mm:ss') + "  Device removed: $serial")
                 $mirrored.Remove($serial)
+                $portsBySerial.Remove($serial)
             }
             elseif ($mirrored[$serial].HasExited) {
                 # User closed the scrcpy window manually -> allow re-mirror later
                 $mirrored.Remove($serial)
+                $portsBySerial.Remove($serial)
             }
         }
 
